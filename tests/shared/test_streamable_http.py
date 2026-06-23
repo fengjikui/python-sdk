@@ -28,7 +28,14 @@ from starlette.types import Message, Scope
 from mcp import MCPError, types
 from mcp.client import ClientRequestContext
 from mcp.client.session import ClientSession
-from mcp.client.streamable_http import StreamableHTTPTransport, streamable_http_client
+from mcp.client.streamable_http import (
+    MAX_RECONNECTION_ATTEMPTS,
+    StreamableHTTPTransport,
+    streamable_http_client,
+)
+from mcp.client.streamable_http import (
+    RequestContext as TransportRequestContext,
+)
 from mcp.server import Server, ServerRequestContext
 from mcp.server.streamable_http import (
     GET_STREAM_KEY,
@@ -1790,6 +1797,37 @@ async def test_server_close_sse_stream_via_context(
 
 
 @pytest.mark.anyio
+async def test_sse_stream_close_raises_when_reconnection_fails(
+    event_app: tuple[SimpleEventStore, Starlette],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Client unblocks the pending request when an SSE response cannot reconnect."""
+    _, app = event_app
+
+    async def _always_fail_reconnection(
+        self: StreamableHTTPTransport,
+        ctx: TransportRequestContext,
+        last_event_id: str,
+        retry_interval_ms: int | None = None,
+        attempt: int = 0,
+    ) -> bool:
+        return False
+
+    monkeypatch.setattr(StreamableHTTPTransport, "_handle_reconnection", _always_fail_reconnection)
+
+    async with (
+        make_client(app) as http_client,
+        streamable_http_client(f"{BASE_URL}/mcp", http_client=http_client) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as session,
+    ):
+        await session.initialize()
+
+        with pytest.raises(MCPError):
+            with anyio.fail_after(5):
+                await session.call_tool("tool_with_stream_close", {})
+
+
+@pytest.mark.anyio
 async def test_streamable_http_client_auto_reconnects(
     event_app: tuple[SimpleEventStore, Starlette],
 ) -> None:
@@ -2170,6 +2208,35 @@ async def test_streamable_http_client_preserves_custom_with_mcp_headers(context_
 
                 assert "content-type" in headers_data
                 assert headers_data["content-type"] == "application/json"
+
+
+@pytest.mark.anyio
+async def test_handle_reconnection_returns_false_on_max_attempts() -> None:
+    """_handle_reconnection returns False when the reconnect budget is exhausted."""
+    transport = StreamableHTTPTransport(url="http://localhost:9999/mcp")
+    read_stream_writer, read_stream = create_context_streams[SessionMessage | Exception](1)
+    session_message = SessionMessage(JSONRPCRequest(jsonrpc="2.0", id=42, method="tools/call"))
+    client = httpx.AsyncClient(trust_env=False)
+    ctx = TransportRequestContext(
+        client=client,
+        session_id="test-session",
+        session_message=session_message,
+        metadata=None,
+        read_stream_writer=read_stream_writer,
+    )
+
+    try:
+        result = await transport._handle_reconnection(  # pyright: ignore[reportPrivateUsage]
+            ctx,
+            last_event_id="evt-1",
+            retry_interval_ms=None,
+            attempt=MAX_RECONNECTION_ATTEMPTS,
+        )
+        assert result is False
+    finally:
+        await client.aclose()
+        await read_stream_writer.aclose()
+        await read_stream.aclose()
 
 
 @pytest.mark.anyio
