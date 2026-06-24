@@ -1,6 +1,14 @@
 from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
-from pydantic import AnyHttpUrl, AnyUrl, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AnyHttpUrl, AnyUrl, BaseModel, ConfigDict, Field, field_serializer, field_validator
+
+
+def _canonical_server_uri(url: AnyHttpUrl) -> str:
+    parsed = urlsplit(str(url))
+    if parsed.path == "/" and not parsed.query and not parsed.fragment:
+        return urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
+    return str(url)
 
 
 class OAuthToken(BaseModel):
@@ -193,3 +201,11 @@ class ProtectedResourceMetadata(BaseModel):
     dpop_signing_alg_values_supported: list[str] | None = None
     # dpop_bound_access_tokens_required default is False, but omitted here for clarity
     dpop_bound_access_tokens_required: bool | None = None
+
+    @field_serializer("resource")
+    def serialize_resource(self, resource: AnyHttpUrl) -> str:
+        return _canonical_server_uri(resource)
+
+    @field_serializer("authorization_servers")
+    def serialize_authorization_servers(self, authorization_servers: list[AnyHttpUrl]) -> list[str]:
+        return [_canonical_server_uri(server) for server in authorization_servers]
